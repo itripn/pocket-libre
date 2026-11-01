@@ -398,6 +398,9 @@ async def process_recording(date: str, timestamp: str):
 
         transcript_path = rec_dir / f"{timestamp}_transcript.txt"
         transcript_path.write_text(transcript_text, encoding="utf-8")
+        # The web path never produces voiceprints; an earlier run's sidecar no longer matches.
+        from pocket_libre.speakers import remove_stale_sidecar
+        remove_stale_sidecar(rec_dir, timestamp)
         yield _sse({"step": "diarize", "message": "Transcript saved"})
 
         # Summarize
@@ -559,6 +562,8 @@ async def sync_all():
             transcript_text = format_transcript_for_summary(labeled)
             transcript_path = rec_dir / f"{rec.timestamp}_transcript.txt"
             transcript_path.write_text(transcript_text, encoding="utf-8")
+            from pocket_libre.speakers import remove_stale_sidecar
+            remove_stale_sidecar(rec_dir, rec.timestamp)
 
             # Summarize
             if anthropic_key:

@@ -232,7 +232,7 @@ def load_analyses(rec_dir, timestamp: str) -> dict[str, dict | str]:
 
     for path in rec_dir.glob(f"{timestamp}_*.json"):
         name = path.stem.replace(f"{timestamp}_", "")
-        if name in ("transcript",):
+        if name in ("transcript", "speakers"):
             continue
         try:
             results[name] = json.loads(path.read_text(encoding="utf-8"))
