@@ -11,6 +11,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A failed connection in `pair` and `setup` now says why. A BLE timeout has
   no message of its own, so the error used to end at the colon
   ([#38](https://github.com/shahcolate/pocket-libre/issues/38)).
+- `speakers fix` keeps a transcript's and summary's modified time when it
+  relabels them, so the file still shows when the meeting happened.
+- Speaker labels from Claude no longer fall back to a single speaker on long
+  recordings. The reply was cut off at 1,500 tokens; it now gets room that grows
+  with the transcript, and if it is still cut off the complete entries are kept.
+- Transcript lines are labeled with the speaker who talks most of each segment,
+  not the one at its midpoint. Speaker turns rarely line up with Whisper's
+  segments, and on a 24-minute recording 55 of 132 turns came out `Unknown`;
+  it is now 4.
+- pyannote 4 works: `diarize_pyannote` passed `use_auth_token` (renamed `token`)
+  and read the result as an `Annotation` (it is now a `DiarizeOutput`), so with
+  pyannote 4 installed it always failed and fell back to Claude. A gated model
+  now says to accept its terms instead of failing on `None`.
+
+### Added
+
+- A recordings index. `~/Pocket Libre/index.md` lists every recording by local
+  day (folders and `PH` names are UTC, so an evening call sits in tomorrow's
+  folder) with its time, title, length, speakers and links. It is refreshed
+  after each summary and after `speakers fix`; `pocket-libre index` rebuilds it
+  and `--titles` adds titles to older summaries.
+- Summaries start with a short title the model writes, then the recording's
+  local start time and a line with the day, length and id. The time in the
+  heading is now when the recording started, not when the summary was written;
+  pocket-todos reads the heading the same way.
+- Speaker recognition. Name a speaker once with `pocket-libre speakers fix` and
+  later recordings label that voice by name instead of `Speaker N`, in the
+  transcript and the summary; doubtful matches stay `Speaker N`. `speakers
+  list`, `forget` and `scores` manage the library and show match scores, and
+  `[voices] threshold`, `margin` and `min_seconds` tune it. It needs pyannote
+  and a HuggingFace token; Claude-based speaker labels carry no voiceprints.
+  Voiceprints are kept in owner-only files (`~/.pocket-libre/voices.json`,
+  `*_speakers.json`) that should not be shared. A wrong name is undone with
+  `speakers fix <recording> <name> "Speaker N"`.
+- Optional `mlx-whisper` backend for Apple Silicon (`pip install -e ".[mlx]"`).
+  It runs Whisper on the GPU and is several times faster than openai-whisper on
+  the CPU. `[defaults] whisper_backend` (`auto`, `mlx`, `whisper`) and
+  `POCKET_LIBRE_WHISPER_BACKEND` choose; `auto` uses MLX when it is installed.
+- pyannote runs on CUDA or Apple's GPU (`mps`) when available, retrying on the
+  CPU if the GPU run fails. `POCKET_LIBRE_DIARIZE_DEVICE` and
+  `POCKET_LIBRE_DIARIZE_MODEL` override the device and the pipeline.
+
+- `[hooks] on_summary` runs a command of your choosing, with the summary's path
+  as its last argument, after `sync`, `watch` or `process` writes a summary.
+  A failing hook only warns.
+>>>>>>> ad5fb9a (Wire up speaker recognition, index, mlx backend, and hooks in CLI and config; document)
 
 ## [1.2.0] — 2026-10-12
 

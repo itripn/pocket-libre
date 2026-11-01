@@ -139,6 +139,46 @@ def test_merge_marks_uncovered_span_unknown():
     assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Unknown"
 
 
+def test_merge_labels_a_segment_whose_midpoint_falls_in_a_gap():
+    """Speaker turns rarely line up with Whisper's segments; a gap at the midpoint is not silence."""
+    whisper = [{"start": 0.0, "end": 6.0, "text": "Hello"}]  # midpoint 3.0
+    speakers = [SpeakerSegment(0.0, 2.5, "Alice"), SpeakerSegment(3.5, 4.0, "Bob")]
+    assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Alice"
+
+
+def test_merge_gives_a_segment_to_whoever_talks_most_of_it():
+    whisper = [{"start": 0.0, "end": 5.0, "text": "Hello"}]  # midpoint 2.5 is Bob's
+    speakers = [
+        SpeakerSegment(0.0, 2.0, "Alice"),
+        SpeakerSegment(2.0, 3.0, "Bob"),
+        SpeakerSegment(3.0, 5.0, "Alice"),
+    ]
+    assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Alice"
+
+
+def test_merge_adds_up_a_speakers_separate_turns():
+    whisper = [{"start": 0.0, "end": 10.0, "text": "Hello"}]
+    speakers = [
+        SpeakerSegment(0.0, 3.0, "Alice"),
+        SpeakerSegment(3.0, 7.0, "Bob"),
+        SpeakerSegment(7.0, 10.0, "Alice"),
+    ]
+    assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Alice"
+
+
+def test_merge_still_labels_a_zero_length_segment_by_position():
+    whisper = [{"start": 1.0, "end": 1.0, "text": "Hm"}]
+    speakers = [SpeakerSegment(0.0, 5.0, "Alice")]
+    assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Alice"
+
+
+def test_merge_marks_a_segment_in_a_gap_between_turns_unknown():
+    """Nothing overlaps it, so there is no speaker to give it."""
+    whisper = [{"start": 10.0, "end": 12.0, "text": "Hello"}]
+    speakers = [SpeakerSegment(0.0, 5.0, "Alice"), SpeakerSegment(20.0, 25.0, "Bob")]
+    assert merge_transcript_with_speakers(whisper, speakers)[0]["speaker"] == "Unknown"
+
+
 def test_merge_strips_whitespace():
     whisper = [{"start": 0.0, "end": 2.0, "text": "  padded  "}]
     assert merge_transcript_with_speakers(whisper, [])[0]["text"] == "padded"

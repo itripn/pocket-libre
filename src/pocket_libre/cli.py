@@ -24,10 +24,12 @@ from pocket_libre.config import (
     save_config,
 )
 from pocket_libre.explorer import explore_device
+from pocket_libre.hooks import run_summary_hook
+from pocket_libre.index import update_index
 from pocket_libre.probe import probe_characteristic
 from pocket_libre.scanner import scan_devices
 from pocket_libre.sniffer import sniff_all
-from pocket_libre.transcribe import transcribe_audio
+from pocket_libre.transcribe import transcribe_audio, transcribe_file
 
 console = Console()
 
@@ -1143,22 +1145,18 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
             # Transcribe
             console.print(f"  [dim]Transcribing ({whisper_model})...[/dim]")
             try:
-                import whisper
-                model = whisper.load_model(whisper_model)
-                result = model.transcribe(str(audio_path), verbose=False)
-                segments = result.get("segments", [])
+                segments = transcribe_file(audio_path, whisper_model)["segments"]
             except Exception as e:
                 console.print(f"  [red]Transcription failed: {e}[/red]")
                 continue
 
             # Diarize
             try:
-                from pocket_libre.diarize import diarize_auto, merge_transcript_with_speakers
-                speaker_segments = diarize_auto(
-                    segments, audio_path=str(audio_path),
-                    hf_token=hf_token, anthropic_key=anthropic_key,
+                from pocket_libre.speakers import label_transcript
+                labeled = label_transcript(
+                    segments, str(audio_path), rec_dir, rec.timestamp,
+                    hf_token, anthropic_key, config,
                 )
-                labeled = merge_transcript_with_speakers(segments, speaker_segments)
             except Exception:
                 labeled = [{"start": s["start"], "end": s["end"], "speaker": "Speaker", "text": s["text"]} for s in segments]
 
@@ -1172,7 +1170,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
             if anthropic_key:
                 console.print("  [dim]Summarizing...[/dim]")
                 try:
-                    from pocket_libre.summarize import summarize_transcript, summary_stamp
+                    from pocket_libre.summarize import make_title, summarize_transcript, summary_document
                     summary = summarize_transcript(
                         transcript_text=transcript_text,
                         api_key=anthropic_key,
@@ -1181,10 +1179,15 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
                     )
                     if summary:
                         summary_path = rec_dir / f"{rec.timestamp}_summary.md"
-                        ts = summary_stamp()
-                        full_doc = f"# {rec.timestamp} ({ts})\n\n{summary}\n\n---\n\n## Full Transcript\n\n{transcript_text}"
+                        full_doc = summary_document(
+                            rec.timestamp, summary, transcript_text,
+                            title=make_title(summary, anthropic_key),
+                            duration_s=segments[-1]["end"] if segments else rec.duration_s,
+                        )
                         summary_path.write_text(full_doc, encoding="utf-8")
                         console.print("  [green]Summary saved[/green]")
+                        run_summary_hook(summary_path)
+                        update_index(out_root)
                 except Exception as e:
                     console.print(f"  [yellow]Summary failed: {e}[/yellow]")
 
@@ -1242,25 +1245,20 @@ def process(ctx, input_path: str, whisper_model: str | None, style: str | None,
     # Transcribe
     console.print("\n[bold cyan]Step 1/3: Transcribing...[/bold cyan]\n")
     try:
-        import whisper
+        segments = transcribe_file(input_file, whisper_model)["segments"]
     except ImportError:
         console.print("[red]Whisper not installed.[/red]")
         return
-
-    model = whisper.load_model(whisper_model)
-    result = model.transcribe(str(input_file), verbose=False)
-    segments = result.get("segments", [])
     console.print(f"[green]Transcribed: {len(segments)} segments[/green]")
 
     # Diarize
     console.print("\n[bold cyan]Step 2/3: Identifying speakers...[/bold cyan]\n")
-    from pocket_libre.diarize import diarize_auto, merge_transcript_with_speakers
+    from pocket_libre.speakers import label_transcript
 
-    speaker_segments = diarize_auto(
-        segments, audio_path=str(input_file),
-        hf_token=hf_token, anthropic_key=anthropic_key,
+    labeled = label_transcript(
+        segments, str(input_file), out_dir, stem,
+        hf_token, anthropic_key, config,
     )
-    labeled = merge_transcript_with_speakers(segments, speaker_segments)
 
     from pocket_libre.summarize import format_transcript_for_summary
     transcript_text = format_transcript_for_summary(labeled)
@@ -1285,7 +1283,7 @@ def process(ctx, input_path: str, whisper_model: str | None, style: str | None,
                 border_style="yellow",
             ))
         else:
-            from pocket_libre.summarize import estimate_cost, summarize_transcript, summary_stamp
+            from pocket_libre.summarize import estimate_cost, make_title, summarize_transcript, summary_document
             est = estimate_cost(transcript_text)
             console.print(f"[dim]Estimated cost: {est}[/dim]")
 
@@ -1297,15 +1295,17 @@ def process(ctx, input_path: str, whisper_model: str | None, style: str | None,
 
             if summary:
                 summary_path = out_dir / f"{stem}_summary.md"
-                ts = summary_stamp()
-                full_doc = (
-                    f"# {stem} ({ts})\n\n"
-                    + summary
-                    + "\n\n---\n\n## Full Transcript\n\n"
-                    + transcript_text
+                full_doc = summary_document(
+                    stem, summary, transcript_text,
+                    title=make_title(summary, anthropic_key),
+                    duration_s=segments[-1]["end"] if segments else None,
                 )
                 summary_path.write_text(full_doc, encoding="utf-8")
                 console.print(f"[green]Summary saved: {summary_path}[/green]")
+                run_summary_hook(summary_path)
+                root = Path(get_output_dir(config))
+                if root.is_dir() and out_dir.resolve().parent == root.resolve():
+                    update_index(root)
 
     console.print("\n[bold green]Done![/bold green]")
 
@@ -1696,6 +1696,209 @@ def web(host: str, port: int, no_browser: bool):
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{browse_host}:{port}")).start()
 
     uvicorn.run("pocket_libre.web.app:app", host=host, port=port, log_level="warning")
+
+
+# ── Speakers ──────────────────────────────
+
+
+@cli.command("index")
+@click.option("--titles", is_flag=True,
+              help="Also ask Claude for a title for summaries that lack one (a few cents).")
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Don't ask before adding titles.")
+@click.pass_context
+def index_command(ctx, titles: bool, assume_yes: bool):
+    """Rebuild index.md: your recordings by local day, with titles.
+
+    Reads the recordings and changes none of them, except with --titles, which
+    adds a title to the heading of each untitled summary (timestamps kept).
+    """
+    from pocket_libre import index as index_mod
+    from pocket_libre.speakers import _write_text_atomic
+
+    config = ctx.obj["config"]
+    root = Path(get_output_dir(config))
+    if not root.is_dir():
+        console.print(f"[red]Output folder not found: {escape(str(root))}[/red]")
+        raise SystemExit(1)
+
+    if titles:
+        api_key = resolve_anthropic_key(config, None)
+        if not api_key:
+            console.print("[red]--titles needs an Anthropic API key (run `pocket-libre setup`).[/red]")
+            raise SystemExit(1)
+        pending = index_mod.untitled_summaries(root)
+        if not pending:
+            console.print("[dim]Every summary already has a title.[/dim]")
+        elif assume_yes or click.confirm(
+            f"Ask Claude for titles for {len(pending)} summaries?", default=False
+        ):
+            from pocket_libre.summarize import make_title
+
+            added = 0
+            for path in pending:
+                stem = path.name[: -len("_summary.md")]
+                try:
+                    text = path.read_text(encoding="utf-8")
+                    title = make_title(index_mod.summary_body(text), api_key)
+                    if title:
+                        _write_text_atomic(path, index_mod.retitle(text, stem, title))
+                        added += 1
+                except OSError as e:
+                    console.print(f"[yellow]Skipped {escape(path.name)}: {escape(str(e))}[/yellow]")
+            console.print(f"[green]Titled {added} of {len(pending)} summaries.[/green]")
+
+    path = index_mod.write_index(root)
+    console.print(f"[green]Index written: {escape(str(path))}[/green]")
+
+
+@cli.group()
+def speakers():
+    """Confirm who the speakers in a recording are."""
+
+
+@speakers.command("fix")
+@click.argument("recording")
+@click.argument("speaker")
+@click.argument("name")
+@click.pass_context
+def speakers_fix(ctx, recording: str, speaker: str, name: str):
+    """Name a speaker and teach their voice to the library.
+
+    \b
+    RECORDING is a recording id, a path to its summary/transcript/speakers file,
+    or `latest`. SPEAKER is a label like "Speaker 2" or the name now assigned.
+    """
+    from datetime import date
+
+    from pocket_libre import speakers as speakers_mod
+    from pocket_libre import voices
+
+    config = ctx.obj["config"]
+    try:
+        sidecar = speakers_mod.find_recording(Path(get_output_dir(config)), recording)
+        message = speakers_mod.fix_speaker(
+            sidecar, speaker, name, voices.load_settings(config), date.today().isoformat(),
+        )
+    except (LookupError, ValueError) as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise SystemExit(1)
+    except Exception as e:
+        console.print(f"[red]Could not update the recording: {escape(str(e))}[/red]")
+        raise SystemExit(1)
+    console.print(escape(message))
+    update_index(Path(get_output_dir(config)))
+
+
+@speakers.command("list")
+def speakers_list():
+    """Show the people whose voices are known."""
+    from rich.table import Table
+
+    from pocket_libre import voices
+
+    try:
+        lib = voices.load_library()
+    except Exception as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise SystemExit(1)
+    if not lib["people"]:
+        console.print("[dim]No known voices yet. Name a speaker with `speakers fix`.[/dim]")
+        return
+
+    table = Table(title="Known voices")
+    table.add_column("Name", style="cyan")
+    table.add_column("Samples", justify="right")
+    table.add_column("Latest sample", style="yellow")
+    for name, person in sorted(lib["people"].items()):
+        samples = person.get("samples", [])
+        latest = max((str(s.get("date", "")) for s in samples), default="")
+        table.add_row(escape(name), str(len(samples)), escape(latest) or "-")
+    console.print(table)
+
+
+@speakers.command("forget")
+@click.argument("name")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Don't ask for confirmation.")
+def speakers_forget(name: str, assume_yes: bool):
+    """Delete a person and all their voice samples."""
+    from pocket_libre import voices
+
+    try:
+        lib = voices.load_library()
+    except Exception as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise SystemExit(1)
+    if name not in lib["people"]:
+        console.print(f"[red]No known voice named {escape(repr(name))}.[/red]")
+        raise SystemExit(1)
+    count = len(lib["people"][name].get("samples", []))
+    if not assume_yes and not click.confirm(
+            f"Delete {name} and {count} voice sample(s)?", default=False):
+        console.print("Cancelled.")
+        return
+    voices.forget(lib, name)
+    try:
+        voices.save_library(lib)
+    except Exception as e:
+        console.print(f"[red]Could not save the library: {escape(str(e))}[/red]")
+        raise SystemExit(1)
+    console.print(f"Forgot {escape(name)} ({count} sample(s)).")
+
+
+@speakers.command("scores")
+@click.argument("recording")
+@click.pass_context
+def speakers_scores(ctx, recording: str):
+    """Show how each speaker in a recording scores against known voices.
+
+    Read-only; use it to tune [voices] threshold, margin and min_seconds.
+    """
+    from rich.table import Table
+
+    from pocket_libre import speakers as speakers_mod
+    from pocket_libre import voices
+
+    config = ctx.obj["config"]
+    try:
+        sidecar = speakers_mod.find_recording(Path(get_output_dir(config)), recording)
+        data = speakers_mod.read_sidecar(sidecar)
+        lib = voices.load_library()
+        settings = voices.load_settings(config)
+    except LookupError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise SystemExit(1)
+    except Exception as e:
+        console.print(f"[red]Could not read the scores: {escape(str(e))}[/red]")
+        raise SystemExit(1)
+
+    people = sorted(lib["people"])
+    if not people:
+        console.print("[dim]No known voices yet. Name a speaker with `speakers fix` first.[/dim]")
+        return
+    found = data.get("speakers", {})
+    model = data.get("model")
+    scores = voices.score_speakers(found, lib, model)
+    named = voices.match_speakers(found, lib, settings, model)
+
+    console.print(
+        f"threshold={settings.threshold:g}  margin={settings.margin:g}  "
+        f"min_seconds={settings.min_seconds:g}"
+    )
+    table = Table(title="Voice scores")
+    table.add_column("Speaker", style="cyan")
+    table.add_column("Speech", justify="right")
+    for person in people:
+        table.add_column(escape(person), justify="right")
+    table.add_column("Would be named", style="green")
+    for label, spk in found.items():
+        seconds = spk.get("seconds", 0.0)
+        speech = f"{seconds:.0f}s"
+        if seconds < settings.min_seconds:
+            speech = f"[red]{speech}[/red]"
+        row_scores = scores.get(label, {})
+        cells = [f"{row_scores[p]:.2f}" if p in row_scores else "-" for p in people]
+        table.add_row(escape(label), speech, *cells, escape(named.get(label, "-")))
+    console.print(table)
 
 
 if __name__ == "__main__":

@@ -193,6 +193,27 @@ Leave `watch` running and recordings sync themselves whenever the Pocket comes
 in range. It backs off to five-minute checks while the device is away, so it
 isn't scanning flat out all day.
 
+### Finding a recording
+
+Recordings are saved under `~/Pocket Libre/<date>/`, named `PH<yymmdd><hhmmss>`.
+The device clock is UTC, so both the folder and the name are UTC: a call at 7 pm
+on the 19th lands in the `2026-10-20` folder.
+
+To look things up in your own time, open `~/Pocket Libre/index.md`. It lists
+every recording by local day, newest first, with start time, title, length,
+who spoke, and links to the summary, transcript and audio. It is refreshed
+after each summary and after `speakers fix`, and can be rebuilt at any time:
+
+```bash
+pocket-libre index            # rebuild index.md (changes no recording)
+pocket-libre index --titles   # also title older summaries (asks first; a few cents)
+```
+
+Each new summary starts with a title the model writes from the summary
+(`# Budget sync (2026-10-20 07:30 -07:00)`), the recording's local start time,
+and a line with the day, length and recording id. With no API key the heading
+is just the id, as before.
+
 ### Freeing up space on the device
 
 `pocket-libre delete --downloaded` removes from the device every recording that
@@ -227,6 +248,8 @@ once they finish. To delete one recording, use
 | `process` | Process an existing audio file |
 | `transcribe` | Transcribe locally with Whisper |
 | `convert` | Convert raw audio to WAV |
+| `index` | Rebuild `index.md`: your recordings by local day, with titles ([details](#finding-a-recording)) |
+| `speakers` | Confirm who speakers are and manage known voices (`fix`, `list`, `forget`, `scores`; [details](#speaker-recognition)) |
 | `wifi-transfer` | Download over WiFi instead of BLE, about 1 MB/s ([details](#wifi-transfer)) |
 | `wifi-discover` | Sweep the device's WiFi AP for listening sockets (diagnostic) |
 | `explore` | Dump GATT services and characteristics |
@@ -257,11 +280,47 @@ summary_style = "meeting"
 
 [analysis]
 enabled = "summary,entities"
+
+[hooks]
+on_summary = "~/bin/handle-summary"
 ```
 
 Set values directly with `pocket-libre config --set device.address=...`.
 Resolution order is CLI flag → environment variable → config file → default,
 so `ANTHROPIC_API_KEY` in your shell overrides the file.
+
+### Faster transcription on Apple Silicon
+
+openai-whisper runs on the CPU. On a Mac with Apple Silicon, `mlx-whisper` runs
+the same model on the GPU, several times faster (a 3-minute clip took 3.4 s
+against 24 s on the CPU in one test).
+
+```bash
+pip install -e ".[mlx]"
+```
+
+That is all: with `mlx-whisper` installed, `whisper_backend = "auto"` (the
+default) uses it for `sync`, `watch`, `process` and `transcribe`, and uses
+openai-whisper everywhere else. The first run downloads the model from
+HuggingFace (`mlx-community/whisper-<model>-mlx`). Force one or the other with
+`pocket-libre config --set defaults.whisper_backend=mlx` (or `whisper`), or with
+`POCKET_LIBRE_WHISPER_BACKEND`. Asking for `mlx` when it can't run is an error,
+not a quiet fallback. The two don't produce identical text, and they split it
+into segments differently; both are normal Whisper variation.
+
+### Hooks
+
+`hooks.on_summary` is a command run after `sync`, `watch` or `process` writes a
+summary. The path to the `*_summary.md` file is appended as its last argument,
+so `on_summary = "~/bin/handle-summary --quiet"` runs
+`~/bin/handle-summary --quiet "/path/to/PH…_summary.md"`. The command is split
+like a shell line but never run through a shell, so paths with spaces arrive
+intact. It can also be set with `POCKET_LIBRE_ON_SUMMARY`.
+
+A hook that fails, isn't found, or runs longer than five minutes only prints a
+warning; it never stops the sync. The summary file holds the full transcript
+below a `## Full Transcript` heading, so a hook that sends the summary anywhere
+should cut it there if the transcript shouldn't leave the machine.
 
 ## API keys
 
@@ -277,6 +336,90 @@ a single unnamed speaker.
 That cost estimate assumes Claude Haiku 4.5 at $1 and $5 per million input and
 output tokens, on a half-hour recording with summary, entities, and mind map all
 enabled. Every command prints what it actually spent.
+
+### Speaker labels
+
+Claude only sees the transcript text, not the audio, so it guesses who is
+speaking from the words and will happily invent speakers. pyannote works from the
+audio and is much more reliable; use it if you can.
+
+To enable it, install the extra (`pip install -e ".[diarize]"`), create a
+HuggingFace token, and open the model page
+[`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1)
+while signed in to the same account to accept its terms. pyannote 4 may also
+ask you to accept the terms of the models that pipeline loads (the page tells
+you). Then `pocket-libre config --set api.hf_token=hf_...`.
+
+pyannote runs on the fastest device it finds (CUDA, then Apple's GPU through
+`mps`, then the CPU). If a run fails on the GPU it retries on the CPU. Force a
+device with `POCKET_LIBRE_DIARIZE_DEVICE=cpu`, or try another pipeline with
+`POCKET_LIBRE_DIARIZE_MODEL=pyannote/speaker-diarization-community-1`.
+
+### Speaker recognition
+
+pyannote already computes a voiceprint for every speaker. Once you have told
+pocket-libre who someone is, it recognises that voice in later recordings and
+writes their name instead of `Speaker 2`, in the transcript and the summary. It
+needs the pyannote setup from [Speaker labels](#speaker-labels). Only a clear
+match gets a name; anything doubtful stays `Speaker N`.
+
+Two kinds of file hold voiceprints, so **do not share or sync them**:
+
+- `~/.pocket-libre/voices.json`, the library of known voices (file mode 600,
+  folder mode 700).
+- `<recording>_speakers.json`, next to each transcript (mode 600). It holds the
+  voiceprint of everyone recorded, enrolled or not.
+
+Teach it a voice by naming a speaker in one recording:
+
+```bash
+pocket-libre speakers fix latest "Speaker 2" Alice
+```
+
+`RECORDING` is a path to the recording's summary, transcript or
+`_speakers.json`, a recording id such as `PH261020213653`, or `latest`.
+`SPEAKER` is a label like `Speaker 2` or the name currently assigned, so the
+same command corrects a wrong name. It relabels the transcript and summary and
+adds the voice to the library; this is the only thing that teaches the library.
+A speaker with speech under `min_seconds` (8 by default) is relabelled but adds
+no sample. To undo a wrong name, give the speaker's own label back:
+`pocket-libre speakers fix latest Alice "Speaker 2"` restores `Speaker 2` and
+removes that voice sample from the library.
+
+| Command | Description |
+|---------|-------------|
+| `speakers fix <recording> <speaker> <name>` | Name a speaker and teach their voice |
+| `speakers list` | Show the people whose voices are known |
+| `speakers forget <name>` | Delete a person and all their samples from `voices.json` (`--yes` skips the prompt) |
+| `speakers scores <recording>` | Show how each speaker scores against known voices; read-only |
+
+To start, run `speakers fix` once on a recording where you know which speaker
+is you, using your own name. If you also use the separate `pocket-todos` tool,
+it matches the name in `POCKET_TODOS_OWNER`, so enroll yourself under exactly
+that name. A recording made before this feature has no `_speakers.json`; run
+`pocket-libre process` on it again to create one. That redoes the transcript
+and summary (calling Claude again) and overwrites earlier relabels: fixes that
+taught the library come back by matching, fixes made on short speech do not.
+
+`speakers forget` removes the person from `voices.json` only. It does not
+remove their voiceprints from existing `*_speakers.json` files or change names
+already written in transcripts and summaries; delete those `_speakers.json`
+files to remove the voiceprints.
+
+Matching is tuned in `config.toml`:
+
+```toml
+[voices]
+threshold = 0.70    # minimum similarity to name a speaker
+margin = 0.10       # how far ahead of the next-best person the match must be
+min_seconds = 8.0   # speakers with less speech are never matched or learned
+```
+
+These defaults may be tuned; `speakers scores` shows the numbers to tune
+against, and `pocket-libre config --set voices.threshold=0.75` changes one.
+
+Not included yet: searching recordings by speaker, and correcting speakers in
+the web interface.
 
 ## Protocol
 

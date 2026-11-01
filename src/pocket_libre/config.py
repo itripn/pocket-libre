@@ -26,11 +26,15 @@ DEFAULTS = {
     },
     "defaults": {
         "whisper_model": "base.en",
+        "whisper_backend": "auto",
         "summary_style": "meeting",
     },
     "analysis": {
         "enabled": "summary,entities",
         "custom_prompts": "",
+    },
+    "hooks": {
+        "on_summary": "",
     },
 }
 
@@ -139,6 +143,18 @@ def resolve_anthropic_key(config: dict, cli_value: str | None = None) -> str | N
     """Resolve Anthropic API key from config chain."""
     return get(config, "api", "anthropic_key", cli_value=cli_value,
                env_var="ANTHROPIC_API_KEY")
+
+
+def resolve_whisper_backend(config: dict, cli_value: str | None = None) -> str:
+    """Resolve which Whisper implementation to use: auto, mlx or whisper."""
+    return get(config, "defaults", "whisper_backend", cli_value=cli_value,
+               env_var="POCKET_LIBRE_WHISPER_BACKEND", default="auto")
+
+
+def resolve_summary_hook(config: dict, cli_value: str | None = None) -> str | None:
+    """Resolve the command run after each summary is written. Empty when unset."""
+    return get(config, "hooks", "on_summary", cli_value=cli_value,
+               env_var="POCKET_LIBRE_ON_SUMMARY")
 
 
 def resolve_hf_token(config: dict, cli_value: str | None = None) -> str | None:
