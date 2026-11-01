@@ -168,21 +168,18 @@ def _process_recording(
     hf_token: str | None,
 ) -> None:
     """Transcribe, diarize, and summarize one downloaded recording."""
-    import whisper
-
-    from pocket_libre.diarize import diarize_auto, merge_transcript_with_speakers
+    from pocket_libre.config import load_config
+    from pocket_libre.speakers import label_transcript
     from pocket_libre.summarize import format_transcript_for_summary
+    from pocket_libre.transcribe import transcribe_file
 
-    model = whisper.load_model(whisper_model)
-    result = model.transcribe(str(audio_path), verbose=False)
-    segments = result.get("segments", [])
+    segments = transcribe_file(audio_path, whisper_model)["segments"]
 
     try:
-        speakers = diarize_auto(
-            segments, audio_path=str(audio_path),
-            hf_token=hf_token, anthropic_key=anthropic_key,
+        labeled = label_transcript(
+            segments, str(audio_path), rec_dir, timestamp,
+            hf_token, anthropic_key, load_config(),
         )
-        labeled = merge_transcript_with_speakers(segments, speakers)
     except Exception:
         labeled = [
             {"start": s["start"], "end": s["end"], "speaker": "Speaker", "text": s["text"]}
@@ -195,15 +192,24 @@ def _process_recording(
     if not anthropic_key:
         return
 
-    from pocket_libre.summarize import summarize_transcript, summary_stamp
+    from pocket_libre.summarize import make_title, summarize_transcript, summary_document
 
     summary = summarize_transcript(
         transcript_text=transcript_text, api_key=anthropic_key, style=summary_style,
     )
     if summary:
-        stamp = summary_stamp()
-        doc = (
-            f"# {timestamp} ({stamp})\n\n{summary}\n\n---\n\n"
-            f"## Full Transcript\n\n{transcript_text}"
+        doc = summary_document(
+            timestamp, summary, transcript_text,
+            title=make_title(summary, anthropic_key),
+            duration_s=segments[-1]["end"] if segments else None,
         )
-        (rec_dir / f"{timestamp}_summary.md").write_text(doc, encoding="utf-8")
+        summary_path = rec_dir / f"{timestamp}_summary.md"
+        summary_path.write_text(doc, encoding="utf-8")
+
+        from pocket_libre.hooks import run_summary_hook
+
+        run_summary_hook(summary_path)
+
+        from pocket_libre.index import update_index
+
+        update_index(rec_dir.parent)

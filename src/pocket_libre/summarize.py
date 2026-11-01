@@ -1,6 +1,7 @@
 """Summarization using Claude Haiku API. ~$0.001 per recording."""
 
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
 from rich.console import Console
 
@@ -162,3 +163,114 @@ def summary_stamp(now: datetime | None = None) -> str:
         now = now.astimezone()  # local time, with the machine's offset
     offset = now.strftime("%z")
     return f"{now:%Y-%m-%d %H:%M} {offset[:3]}:{offset[3:]}"
+
+
+_PH_STEM = re.compile(r"PH(\d{12})")
+_OLD_STEM = re.compile(r"\d{14}")
+TITLE_MAX = 60
+
+
+def recording_start_local(stem: str) -> datetime | None:
+    """When a recording started, in local time, from its UTC-named stem.
+
+    Handles `PHyymmddHHMMSS` and the older `YYYYMMDDHHMMSS`; None for any
+    other name (e.g. a file passed to `process`).
+    """
+    if _PH_STEM.fullmatch(stem):
+        raw = "20" + stem[2:]
+    elif _OLD_STEM.fullmatch(stem):
+        raw = stem
+    else:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).astimezone()
+    except ValueError:
+        return None
+
+
+def format_duration(seconds: float) -> str:
+    """"42 min", "1 h 05 min", or "<1 min"."""
+    minutes = round(seconds / 60)
+    if seconds < 60 and minutes < 1:
+        return "<1 min"
+    minutes = max(minutes, 1)
+    if minutes >= 60:
+        return f"{minutes // 60} h {minutes % 60:02d} min"
+    return f"{minutes} min"
+
+
+def clean_title(text: str) -> str:
+    """Reduce model output to one plain line safe for a heading and a table cell.
+
+    Parentheses are removed because pocket-todos reads the "(date time offset)"
+    after the title; pipes because the index is a Markdown table.
+    """
+    line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    line = re.sub(r"^[\s#*_>`\"'\u201c\u201d]+", "", line)
+    line = re.sub(r"^title\s*:\s*", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"[()|]", "", line)
+    line = re.sub(r"[*_`\"\u201c\u201d]", "", line)
+    line = re.sub(r"\s+", " ", line).strip(" .'\u2019")
+    if len(line) > TITLE_MAX:
+        line = line[:TITLE_MAX].rsplit(" ", 1)[0] if " " in line[:TITLE_MAX] else line[:TITLE_MAX]
+    return line.strip()
+
+
+TITLE_PROMPT = """Write a title for this meeting summary: at most 8 words, plain text, \
+no quotes, no trailing period. Reply with only the title.
+
+{summary}"""
+
+
+def make_title(summary: str, api_key: str | None, model: str = DEFAULT_MODEL) -> str:
+    """A short title for a summary, or "" if none can be made.
+
+    One small extra call on the summary text (never the transcript), so it
+    works for every summary style. Any failure just means no title.
+    """
+    if not api_key or not summary.strip():
+        return ""
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model=model,
+            max_tokens=40,
+            messages=[{"role": "user", "content": TITLE_PROMPT.format(summary=summary[:6000])}],
+        )
+        return clean_title(message.content[0].text)
+    except Exception:
+        return ""
+
+
+def summary_document(
+    stem: str,
+    summary: str,
+    transcript_text: str,
+    title: str = "",
+    duration_s: float | None = None,
+) -> str:
+    """The summary file: heading, one line of facts, summary, full transcript.
+
+    The heading ends in "(YYYY-MM-DD HH:MM +hh:mm)", the recording's own local
+    start, which pocket-todos reads with the stem's UTC time to find the day.
+    """
+    start = recording_start_local(stem)
+    if start is not None:
+        offset = start.strftime("%z")
+        stamp = f"{start:%Y-%m-%d %H:%M} {offset[:3]}:{offset[3:]}"
+    else:
+        stamp = summary_stamp()
+    facts = []
+    if start is not None:
+        facts.append(f"{start:%a} {start.day} {start:%b}")
+    if duration_s:
+        facts.append(format_duration(duration_s))
+    if title:
+        facts.append(stem)
+    meta = f"*{' · '.join(facts)}*\n\n" if facts else ""
+    return (
+        f"# {title or stem} ({stamp})\n\n{meta}{summary}"
+        f"\n\n---\n\n## Full Transcript\n\n{transcript_text}"
+    )
